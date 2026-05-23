@@ -1,8 +1,16 @@
-# upeep386 — i386 NASM peephole optimizer
+# upeep386 — i386 NASM optimizer toolkit
 
-Language-agnostic peephole optimization library for compilers
-targeting the **Intel 386 (x86-32) processor**, consuming and
-producing flat-32 NASM assembly text.
+Language-agnostic NASM-text optimizer for compilers targeting the
+**Intel 386 (x86-32) processor**. Three composable passes:
+
+* **peephole** — pattern-based instruction rewriting to fixed point
+  (binop_collapse, setcc_jcc_collapse, mov_zero_to_xor, …).
+* **asm_dce** — call/reference-graph dead-code elimination,
+  walking reachability from `_start` / `_main` over the call
+  graph of top-level functions and data labels.
+* **libc_split** — parser for a monolithic libc.asm with per-
+  function dep tracking, so a host compiler can include only the
+  transitive closure of routines the user code references.
 
 Sibling to [upeepz80](https://github.com/avwohl/upeepz80) (Z80
 peephole) and [upeep80](https://github.com/avwohl/upeep80) (8080
@@ -30,11 +38,13 @@ Or from source:
 
 ## Quick start
 
-	from upeep386 import optimize
+	from upeep386 import optimize, dce, parse_libc
 
-	asm_in  = open("user.asm").read()
-	asm_out = optimize(asm_in)
-	open("user.opt.asm", "w").write(asm_out)
+	asm = compiler.emit(...)
+	asm = optimize(asm)          # peephole patterns to fixed point
+	asm = dce(asm)               # drop unreachable functions / labels
+	# parse_libc(libc_asm) lets the host include only the libc
+	# routines the user actually references.
 
 ## Pattern list (current)
 
