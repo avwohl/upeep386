@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0.0", "wheel"]
+# setuptools>=77 is required, not preferred: `license = "GPL-3.0-or-later"`
+# below is a PEP 639 SPDX expression, and setuptools<77 rejects it with
+# "`project.license` must be valid exactly by one definition". The old
+# >=68.0.0 floor was unbuildable at its own lower bound. `wheel` is not
+# needed -- setuptools.build_meta has built wheels itself since v70.
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
