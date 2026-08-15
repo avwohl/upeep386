@@ -3467,6 +3467,25 @@ def test_fpu_op_collapse_faddp():
     assert opt.stats.get("fpu_op_collapse") == 1
 
 
+def test_fpu_op_collapse_skips_tword():
+    """An 80-bit source must NOT collapse: `fld` has an m80fp form
+    but no x87 arithmetic instruction does, so `fmul tword [esi]`
+    is unencodable and NASM rejects it. libc_min's `_pf_pow10`
+    walks a table of 80-bit long doubles exactly this way."""
+    asm = (
+        "_pf_pow10:\n"
+        "        fld     tword [esi]\n"
+        "        fmulp   st1, st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fld     tword [esi]" in out
+    assert "        fmulp" in out
+    assert "fmul    tword" not in out
+    assert opt.stats.get("fpu_op_collapse", 0) == 0
+
+
 def test_fpu_op_collapse_all_ops():
     """faddp/fmulp/fsubp/fdivp/fsubrp/fdivrp all map to memory form."""
     mapping = {
@@ -16294,3 +16313,91 @@ def test_dup_push_pop_self_op_with_commented_operands():
     assert "push    [ebp - 4]" not in out
     assert "pop     ecx" not in out
     assert "add     eax, eax" in out
+
+
+# ── register-passing callees (libc_min.asm's printf helpers) ──────
+
+
+def test_call_reading_eax_keeps_its_argument_setup():
+    """A callee that reads EAX on entry makes EAX LIVE at the call,
+    so `mov eax, LABEL` before it must not be folded away.
+
+    This is libc_min.asm's `_pf_field(eax = text, ecx = length,
+    edx = prefix length)`. Treating every call as a blanket clobber
+    of the caller-saved registers deleted the `mov eax, _pf_scratch`
+    and turned `printf("%d")` into a wild read."""
+    asm = (
+        "_caller:\n"
+        "        mov     eax, _pf_scratch\n"
+        "        mov     ecx, ebx\n"
+        "        sub     ecx, eax\n"
+        "        mov     edx, [ebp - 16]\n"
+        "        call    _pf_field\n"
+        "        ret\n"
+        "_pf_field:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    esi\n"
+        "        mov     esi, eax\n"
+        "        mov     edi, ecx\n"
+        "        mov     ebx, edx\n"
+        "        pop     esi\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, _pf_scratch" in out, (
+        f"EAX setup was deleted:\n{out}"
+    )
+    assert "sub     ecx, _pf_scratch" not in out, (
+        f"EAX setup was folded into the sub:\n{out}"
+    )
+
+
+def test_call_not_reading_eax_still_allows_the_fold():
+    """The mirror case: a cdecl callee that writes EAX before any
+    read leaves it dead across the call, so the fold still fires.
+    The live-in analysis must not be a blanket 'assume live'."""
+    asm = (
+        "_caller:\n"
+        "        mov     eax, _g_arr\n"
+        "        mov     ecx, ebx\n"
+        "        sub     ecx, eax\n"
+        "        call    _cdecl_callee\n"
+        "        ret\n"
+        "_cdecl_callee:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        pop     ebp\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "sub     ecx, _g_arr" in out, (
+        f"expected the label fold to still fire:\n{out}"
+    )
+
+
+def test_call_live_in_covers_ecx_and_edx_too():
+    """`_pf_outrep(dl = char, ecx = count)` reads ECX and EDX, not
+    EAX. The old EAX-only allowlist could not express this."""
+    asm = (
+        "_caller:\n"
+        "        mov     edx, _pf_scratch\n"
+        "        mov     ecx, edi\n"
+        "        sub     ecx, edx\n"
+        "        call    _pf_outrep\n"
+        "        ret\n"
+        "_pf_outrep:\n"
+        "        push    ebx\n"
+        "        mov     ebx, ecx\n"
+        "        mov     [_pf_ch], dl\n"
+        "        pop     ebx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, _pf_scratch" in out, (
+        f"EDX setup was deleted:\n{out}"
+    )

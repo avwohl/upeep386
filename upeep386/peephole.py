@@ -378,9 +378,17 @@ class PeepholeOptimizer:
     """
 
     MAX_PASSES = 10
+    # Refinement rounds for the callee live-in fixpoint. Each round
+    # is a sound over-approximation, so this is a precision knob, not
+    # a correctness one.
+    _CALL_LIVE_IN_ROUNDS = 3
 
     def __init__(self) -> None:
         self.stats: dict[str, int] = {}
+        # label -> registers the callee reads before writing. Empty
+        # until optimize() computes it; an absent key means "follows
+        # cdecl / body not visible", i.e. caller-saved regs are dead.
+        self._call_live_in: dict[str, frozenset[str]] = {}
 
     def optimize(self, asm_text: str) -> str:
         # Preserve trailing newline behavior.
@@ -390,6 +398,9 @@ class PeepholeOptimizer:
 
         for _ in range(self.MAX_PASSES):
             before = len(lines)
+            # Recomputed each round: earlier rounds rewrite callee
+            # bodies, which can change what a callee reads on entry.
+            self._call_live_in = self._compute_call_live_in(lines)
             lines = self._pass_dead_after_terminator(lines)
             lines = self._pass_jmp_to_next_label(lines)
             lines = self._pass_binop_collapse(lines)
@@ -1327,7 +1338,7 @@ class PeepholeOptimizer:
         SUPPORTED_REGS = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"}
 
         def overwrites_reg(line: Line, reg32: str) -> bool:
-            return PeepholeOptimizer._is_pure_reg_write(line, reg32)
+            return self._is_pure_reg_write(line, reg32)
 
         def is_reg_neutral(line: Line, reg32: str) -> bool:
             """Doesn't read or write the register family. May touch
@@ -3290,6 +3301,82 @@ class PeepholeOptimizer:
         "_printf_emit_double",
     })
 
+    # Registers a `call` may pass arguments in. cdecl passes on the
+    # stack and leaves these dead across the call, but the bundled
+    # hand-written libc uses register conventions for its hot inner
+    # helpers, so deadness is decided per callee by
+    # `_compute_call_live_in` rather than assumed.
+    _CALLER_SAVED: tuple[str, ...] = ("eax", "ecx", "edx")
+
+    def _call_reads_reg(self, operand: str, reg32: str) -> bool:
+        """Does `call <operand>` READ reg32 (i.e. is reg32 live-in at
+        the callee) rather than merely clobber it?
+
+        Answered from `self._call_live_in`, the fixpoint computed over
+        the asm text being optimized. A callee whose body is not in
+        this text (an `extern`) is not in the map; those follow cdecl,
+        where the caller-saved registers are genuinely dead.
+        """
+        if reg32 == "eax" and operand in self._CALLS_READ_EAX:
+            return True
+        return reg32 in self._call_live_in.get(operand, ())
+
+    def _compute_call_live_in(
+        self, lines: list[Line]
+    ) -> dict[str, frozenset[str]]:
+        """For every direct `call` target DEFINED in this asm text,
+        which of EAX/ECX/EDX does the callee read before writing?
+
+        A greatest-fixpoint: every target starts fully live (the safe
+        over-approximation) and a register is dropped only once the
+        callee's body provably writes it before any read, under the
+        current assumptions. Both the initial state and every
+        iteration are therefore sound over-approximations, so the
+        iteration can be cut off at any point without becoming
+        unsafe — it only becomes less precise.
+
+        This replaces the previous blanket "a call clobbers EAX/ECX/
+        EDX, so they are dead across it" rule, which silently deleted
+        the argument setup of libc_min.asm's register-passing helpers
+        (`_pf_field(eax=text, ecx=length, edx=prefix)`,
+        `_pf_outn(ecx=count)`, `_pf_outrep(dl=char, ecx=count)`) and
+        turned every printf of a number into a wild read.
+        """
+        label_idx: dict[str, int] = {}
+        for i, ln in enumerate(lines):
+            if ln.kind == "label" and not ln.label.startswith("."):
+                label_idx.setdefault(ln.label, i)
+        targets: set[str] = set()
+        for ln in lines:
+            if ln.kind == "instr" and ln.op == "call":
+                t = ln.operands.strip().lower()
+                if t in label_idx:
+                    targets.add(t)
+        if not targets:
+            return {}
+
+        all_live = frozenset(self._CALLER_SAVED)
+        live: dict[str, frozenset[str]] = {t: all_live for t in targets}
+        saved = self._call_live_in
+        try:
+            for _ in range(self._CALL_LIVE_IN_ROUNDS):
+                self._call_live_in = live
+                nxt: dict[str, frozenset[str]] = {}
+                for t in targets:
+                    body = label_idx[t] + 1
+                    nxt[t] = frozenset(
+                        r for r in self._CALLER_SAVED
+                        if not self._reg_dead_after(
+                            lines, body, r, treat_as_scratch=True,
+                        )
+                    )
+                if nxt == live:
+                    break
+                live = nxt
+        finally:
+            self._call_live_in = saved
+        return live
+
     @staticmethod
     def _references_reg_family(text: str, reg32: str) -> bool:
         """Does `text` reference reg32 or any of its sub-aliases?"""
@@ -3297,8 +3384,7 @@ class PeepholeOptimizer:
             return False
         return PeepholeOptimizer._FAMILY_RE[reg32].search(text) is not None
 
-    @staticmethod
-    def _is_pure_reg_write(line: Line, reg32: str) -> bool:
+    def _is_pure_reg_write(self, line: Line, reg32: str) -> bool:
         """Does this instruction write reg32 in full WITHOUT reading
         any of its sub-aliases first? Pure writes:
         - mov reg, src where src doesn't reference reg-family
@@ -3340,13 +3426,10 @@ class PeepholeOptimizer:
                 # `call [reg + N]` reads reg.
                 if PeepholeOptimizer._references_reg_family(operand, reg32):
                     return False
-            # uc386's libc has helpers that READ EAX as input
-            # (non-cdecl, register-passing — see _CALLS_READ_EAX).
-            # Those calls are NOT a pure-write of EAX since they
-            # use the prior value first.
-            if reg32 == "eax" and operand in (
-                PeepholeOptimizer._CALLS_READ_EAX
-            ):
+            # A callee that READS this register as an input (a
+            # register-passing convention — see _call_reads_reg)
+            # is NOT a pure write: it uses the prior value first.
+            if self._call_reads_reg(operand, reg32):
                 return False
             if reg32 in {"eax", "ecx", "edx"}:
                 return True
@@ -3461,7 +3544,7 @@ class PeepholeOptimizer:
             scanned += 1
             # Check pure-write FIRST (before checking reads), since
             # mov reg, src can be a pure write OR self-RMW.
-            if PeepholeOptimizer._is_pure_reg_write(ln, reg32):
+            if self._is_pure_reg_write(ln, reg32):
                 return True
             # Function exit terminators.
             if ln.op in {"ret", "iret", "iretd", "retf", "retn"}:
@@ -3542,11 +3625,10 @@ class PeepholeOptimizer:
                 if "[" in operand and self._references_reg_family(
                         operand, reg32):
                     return False
-                # uc386's libc has internal helpers that read EAX as
-                # an INPUT register (a non-cdecl, register-passing
-                # convention chosen because they're hot inner loops).
-                # Treat the call as a read of EAX in that case.
-                if reg32 == "eax" and operand in self._CALLS_READ_EAX:
+                # A callee with a register-passing convention reads
+                # this register as an INPUT — the call is a use, not
+                # a clobber, so the value is live here.
+                if self._call_reads_reg(operand, reg32):
                     return False
                 if reg32 in {"eax", "ecx", "edx"}:
                     return True
@@ -6554,6 +6636,15 @@ class PeepholeOptimizer:
         are accepted; bare ``faddp`` (which defaults to st1, st0)
         is also accepted for completeness, though our codegen
         currently always emits the explicit form.
+
+        NOT applied to an 80-bit source. ``fld`` has an m80fp form
+        (``fld tword [esi]``) but the arithmetic instructions do
+        NOT — FADD/FMUL/FSUB/FDIV take m32fp or m64fp only, so
+        ``fmul tword [esi]`` is not an encodable instruction and
+        NASM rejects it with "invalid operand sizes". libc_min's
+        ``_pf_pow10`` walks a table of 80-bit long doubles exactly
+        this way, so the unguarded rewrite broke every build that
+        pulled in the printf float path.
         """
         out: list[Line] = []
         i = 0
@@ -6563,6 +6654,7 @@ class PeepholeOptimizer:
                 i + 1 < len(lines)
                 and line.kind == "instr"
                 and line.op == "fld"
+                and not self._is_m80_operand(line.operands)
             ):
                 nxt = lines[i + 1]
                 mem_form = self._FPU_POP_TO_MEM.get(nxt.op or "")
@@ -6587,6 +6679,16 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    @staticmethod
+    def _is_m80_operand(operands: str) -> bool:
+        """True for an 80-bit (``tword``) memory reference.
+
+        Only ``fld``/``fstp`` (and the BCD/int ``fbld``/``fild``
+        forms) can name an m80 operand; no x87 arithmetic
+        instruction has one.
+        """
+        return re.search(r"\btword\b", operands, re.IGNORECASE) is not None
 
     @staticmethod
     def _is_pop_st1_st0(line: Line) -> bool:
