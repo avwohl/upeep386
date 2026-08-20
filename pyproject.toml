@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "upeep386"
-version = "0.2.0"
+version = "0.2.1"
 description = "i386 NASM optimizer toolkit (peephole + asm-DCE + libc-split) for x86-32 compilers"
 readme = "README.md"
 requires-python = ">=3.10"

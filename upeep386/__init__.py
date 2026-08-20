@@ -35,7 +35,7 @@ emits: NASM `section .text`, `bits 32`, top-level `_name:`
 labels, cdecl calling convention.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__ = "upeep386 project"
 
 from .peephole import (
