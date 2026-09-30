@@ -89,4 +89,4 @@ Input is exactly what uc386 / ucpp386 emit. The optimizer assumes:
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](https://github.com/avwohl/upeep386/blob/main/LICENSE).
